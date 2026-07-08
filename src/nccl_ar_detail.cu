@@ -151,6 +151,7 @@ int main(int argc, char *argv[]) {
     int    n_iters = 20;
     int    warmup_iters = 1;
     const char *json_path = NULL;
+    int    verbose = 0;
     int    op = OP_ALL_REDUCE;
 
     int opt;
@@ -162,6 +163,7 @@ int main(int argc, char *argv[]) {
         case 'n': n_iters = atoi(optarg); break;
         case 'w': warmup_iters = atoi(optarg); break;
         case 'J': json_path = optarg; break;
+        case 'v': verbose = 1; break;
         case 'o':
             op = -1;
             for (int i = 0; i < OP_N; i++)
