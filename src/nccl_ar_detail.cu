@@ -2,6 +2,7 @@
  * NCCL collective benchmark with per-iteration CUDA event timing.
  * Supports: all_reduce, all_gather, reduce_scatter, broadcast, reduce, alltoall.
  * Outputs JSON detail array: {round, size, count, op, type, oop_time_us, ip_time_us}.
+ * Validates every measured collective on the GPU and reports data_ok; exits 2 on mismatch.
  *
  * Build:
  *   nvcc -o nccl_ar_detail nccl_ar_detail.cu \
@@ -29,6 +30,7 @@ static int json_first_elem = 1;
 static void json_open(const char *path) {
     json_fp = fopen(path, "w");
     if (!json_fp) { fprintf(stderr, "cannot open %s\n", path); return; }
+    setbuf(json_fp, NULL);
     fprintf(json_fp, "{");
     json_first_key = 1;
 }
@@ -129,6 +131,71 @@ static int has_in_place(int op) {
     return op == OP_ALL_REDUCE || op == OP_REDUCE;
 }
 
+static ncclResult_t run_collective(int op, const float *send, float *recv,
+                                   size_t count, ncclComm_t comm, cudaStream_t stream) {
+    switch (op) {
+    case OP_ALL_REDUCE:     return ncclAllReduce(send, recv, count, ncclFloat, ncclSum, comm, stream);
+    case OP_ALL_GATHER:     return ncclAllGather(send, recv, count, ncclFloat, comm, stream);
+    case OP_REDUCE_SCATTER: return ncclReduceScatter(send, recv, count, ncclFloat, ncclSum, comm, stream);
+    case OP_BROADCAST:      return ncclBroadcast(send, recv, count, ncclFloat, 0, comm, stream);
+    case OP_REDUCE:         return ncclReduce(send, recv, count, ncclFloat, ncclSum, 0, comm, stream);
+    default:                return ncclInvalidArgument;
+    }
+}
+
+__global__ static void fill_buffer(float *data, size_t count, float value) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < count; i += blockDim.x * gridDim.x) {
+        data[i] = value;
+    }
+}
+
+__global__ static void check_uniform(const float *data, size_t count, float expected, int *error) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < count; i += blockDim.x * gridDim.x) {
+        if (data[i] != expected) atomicExch(error, 1);
+    }
+}
+
+__global__ static void check_all_gather(const float *data, size_t count, int nranks, int *error) {
+    size_t total = count * (size_t)nranks;
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += blockDim.x * gridDim.x) {
+        float expected = (float)(i / count + 1);
+        if (data[i] != expected) atomicExch(error, 1);
+    }
+}
+
+static int blocks_for(size_t count) {
+    size_t blocks = (count + 255) / 256;
+    return (int)(blocks < 65535 ? blocks : 65535);
+}
+
+static void prepare_input(int op, float *send, float *recv, size_t count,
+                          int rank, int nranks, cudaStream_t stream) {
+    size_t send_count = op == OP_REDUCE_SCATTER ? count * (size_t)nranks : count;
+    size_t recv_count = op == OP_ALL_GATHER ? count * (size_t)nranks : count;
+    fill_buffer<<<blocks_for(send_count), 256, 0, stream>>>(send, send_count, (float)(rank + 1));
+    CUDACHECK(cudaGetLastError());
+    fill_buffer<<<blocks_for(recv_count), 256, 0, stream>>>(recv, recv_count, -1.0f);
+    CUDACHECK(cudaGetLastError());
+}
+
+static void validate_output(int op, const float *recv, size_t count, int rank,
+                            int nranks, int *error, cudaStream_t stream) {
+    float sum = (float)(nranks * (nranks + 1) / 2);
+    if (op == OP_REDUCE && rank != 0) return;
+    if (op == OP_ALL_GATHER) {
+        size_t total = count * (size_t)nranks;
+        check_all_gather<<<blocks_for(total), 256, 0, stream>>>(recv, count, nranks, error);
+        CUDACHECK(cudaGetLastError());
+    } else {
+        float expected = op == OP_BROADCAST ? 1.0f : sum;
+        check_uniform<<<blocks_for(count), 256, 0, stream>>>(recv, count, expected, error);
+        CUDACHECK(cudaGetLastError());
+    }
+}
+
 static double now_us() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -183,6 +250,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (min_bytes == 0 || max_bytes < min_bytes || min_bytes % sizeof(float) != 0 ||
+        max_bytes % sizeof(float) != 0 || step_factor < 2 || n_iters < 1 || warmup_iters < 0) {
+        fprintf(stderr, "Invalid arguments: require 0 < min <= max, float-aligned sizes, factor >= 2, "
+                        "iters >= 1, and warmup >= 0\n");
+        return 1;
+    }
+
     int mpi_rank, mpi_size;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
@@ -203,8 +277,11 @@ int main(int argc, char *argv[]) {
     size_t buf_mult = (op == OP_ALL_GATHER || op == OP_REDUCE_SCATTER) ? mpi_size : 1;
     size_t max_buf = max_bytes * buf_mult;
     float *d_send, *d_recv;
+    int *d_data_error;
     CUDACHECK(cudaMalloc(&d_send, max_buf));
     CUDACHECK(cudaMalloc(&d_recv, max_buf));
+    CUDACHECK(cudaMalloc(&d_data_error, sizeof(*d_data_error)));
+    CUDACHECK(cudaMemset(d_data_error, 0, sizeof(*d_data_error)));
 
     cudaEvent_t ev_start, ev_stop;
     CUDACHECK(cudaEventCreate(&ev_start));
@@ -212,13 +289,12 @@ int main(int argc, char *argv[]) {
     cudaStream_t stream;
     CUDACHECK(cudaStreamCreate(&stream));
 
-    if (mpi_rank == 0 && json_path) json_open(json_path);
-
-    /* warmup: init connections */
+    /* Warm up the selected collective so fault injection exercises that operation. */
     {
         size_t wc = min_bytes / sizeof(float);
+        prepare_input(op, d_send, d_recv, wc, mpi_rank, mpi_size, stream);
         for (int i = 0; i < warmup_iters; i++)
-            NCCLCHECK(ncclAllReduce(d_send, d_recv, wc, ncclFloat, ncclSum, comm, stream));
+            NCCLCHECK(run_collective(op, d_send, d_recv, wc, comm, stream));
         CUDACHECK(cudaStreamSynchronize(stream));
     }
 
@@ -235,28 +311,19 @@ int main(int argc, char *argv[]) {
         size_t count = sz / sizeof(float);
 
         /* per-size warmup */
+        prepare_input(op, d_send, d_recv, count, mpi_rank, mpi_size, stream);
         for (int i = 0; i < 3; i++) {
-            switch (op) {
-            case OP_ALL_REDUCE:    NCCLCHECK(ncclAllReduce(d_send, d_recv, count, ncclFloat, ncclSum, comm, stream)); break;
-            case OP_ALL_GATHER:    NCCLCHECK(ncclAllGather(d_send, d_recv, count, ncclFloat, comm, stream)); break;
-            case OP_REDUCE_SCATTER:NCCLCHECK(ncclReduceScatter(d_send, d_recv, count, ncclFloat, ncclSum, comm, stream)); break;
-            case OP_BROADCAST:     NCCLCHECK(ncclBroadcast(d_send, d_recv, count, ncclFloat, 0, comm, stream)); break;
-            case OP_REDUCE:        NCCLCHECK(ncclReduce(d_send, d_recv, count, ncclFloat, ncclSum, 0, comm, stream)); break;
-            }
+            NCCLCHECK(run_collective(op, d_send, d_recv, count, comm, stream));
         }
         CUDACHECK(cudaStreamSynchronize(stream));
 
         /* ---- out-of-place ---- */
+        prepare_input(op, d_send, d_recv, count, mpi_rank, mpi_size, stream);
         for (int iter = 0; iter < n_iters; iter++) {
             CUDACHECK(cudaEventRecord(ev_start, stream));
-            switch (op) {
-            case OP_ALL_REDUCE:    NCCLCHECK(ncclAllReduce(d_send, d_recv, count, ncclFloat, ncclSum, comm, stream)); break;
-            case OP_ALL_GATHER:    NCCLCHECK(ncclAllGather(d_send, d_recv, count, ncclFloat, comm, stream)); break;
-            case OP_REDUCE_SCATTER:NCCLCHECK(ncclReduceScatter(d_send, d_recv, count, ncclFloat, ncclSum, comm, stream)); break;
-            case OP_BROADCAST:     NCCLCHECK(ncclBroadcast(d_send, d_recv, count, ncclFloat, 0, comm, stream)); break;
-            case OP_REDUCE:        NCCLCHECK(ncclReduce(d_send, d_recv, count, ncclFloat, ncclSum, 0, comm, stream)); break;
-            }
+            NCCLCHECK(run_collective(op, d_send, d_recv, count, comm, stream));
             CUDACHECK(cudaEventRecord(ev_stop, stream));
+            validate_output(op, d_recv, count, mpi_rank, mpi_size, d_data_error, stream);
             CUDACHECK(cudaEventSynchronize(ev_stop));
             float ms;
             CUDACHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
@@ -266,12 +333,12 @@ int main(int argc, char *argv[]) {
         /* ---- in-place (only for ops that support it) ---- */
         if (has_ip) {
             for (int iter = 0; iter < n_iters; iter++) {
+                fill_buffer<<<blocks_for(count), 256, 0, stream>>>(d_recv, count, (float)(mpi_rank + 1));
+                CUDACHECK(cudaGetLastError());
                 CUDACHECK(cudaEventRecord(ev_start, stream));
-                switch (op) {
-                case OP_ALL_REDUCE: NCCLCHECK(ncclAllReduce(d_recv, d_recv, count, ncclFloat, ncclSum, comm, stream)); break;
-                case OP_REDUCE:     NCCLCHECK(ncclReduce(d_recv, d_recv, count, ncclFloat, ncclSum, 0, comm, stream)); break;
-                }
+                NCCLCHECK(run_collective(op, d_recv, d_recv, count, comm, stream));
                 CUDACHECK(cudaEventRecord(ev_stop, stream));
+                validate_output(op, d_recv, count, mpi_rank, mpi_size, d_data_error, stream);
                 CUDACHECK(cudaEventSynchronize(ev_stop));
                 float ms;
                 CUDACHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
@@ -281,6 +348,13 @@ int main(int argc, char *argv[]) {
 
         slot += n_iters * slots_per_iter;
     }
+
+    CUDACHECK(cudaStreamSynchronize(stream));
+    int local_data_error = 0;
+    CUDACHECK(cudaMemcpy(&local_data_error, d_data_error, sizeof(local_data_error), cudaMemcpyDeviceToHost));
+    int local_data_ok = local_data_error == 0;
+    int data_ok = 0;
+    MPI_Allreduce(&local_data_ok, &data_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
     /* gather timings to rank 0 */
     double *max_times = NULL;
@@ -293,7 +367,8 @@ int main(int argc, char *argv[]) {
     double t_end = now_us();
 
     /* ---- JSON ---- */
-    if (mpi_rank == 0 && json_path && json_fp) {
+    if (mpi_rank == 0 && json_path) json_open(json_path);
+    if (mpi_rank == 0 && json_fp) {
         json_int("nccl_version", NCCL_VERSION_CODE);
         json_int("n_ranks", mpi_size);
         json_str("op", op_names[op]);
@@ -303,7 +378,7 @@ int main(int argc, char *argv[]) {
         json_int("n_iters", n_iters);
         json_int("warmup_iters", warmup_iters);
         json_double("wall_time_us", t_end - t_start);
-        json_bool("data_ok", 1);
+        json_bool("data_ok", data_ok);
 
         json_arr_start("detail");
         int round = 0, sidx = 0;
@@ -332,7 +407,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ---- summary table ---- */
-    if (mpi_rank == 0) {
+    if (mpi_rank == 0 && verbose) {
         printf("# %s  size         count    oop_avg_us  oop_bw", op_names[op]);
         if (has_ip) printf("    ip_avg_us   ip_bw");
         printf("\n");
@@ -369,7 +444,9 @@ int main(int argc, char *argv[]) {
     CUDACHECK(cudaStreamDestroy(stream));
     CUDACHECK(cudaFree(d_send));
     CUDACHECK(cudaFree(d_recv));
+    CUDACHECK(cudaFree(d_data_error));
     ncclCommDestroy(comm);
     MPI_Finalize();
-    return 0;
+    if (!data_ok && mpi_rank == 0) fprintf(stderr, "Data validation failed\n");
+    return data_ok ? 0 : 2;
 }
